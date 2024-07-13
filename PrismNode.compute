@@ -1,0 +1,192 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel BuildPrismMesh
+
+struct Vertex
+{
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+
+struct Triangle
+{
+    int subIndex;
+    int a;
+    int b;
+    int c;
+};
+
+RWStructuredBuffer<Vertex> vertices;
+AppendStructuredBuffer<Triangle> triangles;
+
+StructuredBuffer<float3> polySummits;
+float2 topOffset;
+uint2 sampling;
+float slope;
+
+uint BaseCount(uint polyCount)
+{
+    return 1 + uint(sampling.x * (sampling.x + 1) * (polyCount / 2.0));
+}
+
+uint SideCount(int polyCount)
+{
+    return (sampling.y - 1) * sampling.x * polyCount;
+}
+
+uint VertexIndex(uint polyCount, uint x, uint y, uint z)
+{
+    y = clamp(y, 0, sampling.y);
+    z = y == 0 || y == sampling.y ? clamp(z, 0, sampling.x) : sampling.x;
+    x = z == 0 ? 0 : (x % (z * polyCount));
+
+    int b = y > 0 ? BaseCount(polyCount) : uint(z * (z - 1) * polyCount / 2.0) + x + min(z, 1);
+    int m = y == 0 || sampling.y < 2 ? 0 : y == sampling.y ? SideCount(polyCount) : max(y - 1, 0) * z * polyCount + x;
+    int t = y < sampling.y ? 0 : uint(z * (z - 1) * polyCount / 2.0) + x + min(z, 1);
+
+    return b + m + t;
+}
+
+float CenterHeight(uint polyCount)
+{
+    float min = 0.0;
+    float max = 0.0;
+    float middle = 0.0;
+    
+    for (uint index = 0; index < polyCount; index++)
+    {
+        min = polySummits[index].y < min ? polySummits[index].y : min;
+        max = polySummits[index].y > max ? polySummits[index].y : max;
+        middle += polySummits[index].y;
+    }
+    middle /= polyCount;
+    
+    float t = clamp(slope, -1.0, 1.0);
+    return t < 0.0 ? lerp(min, middle, t + 1.0) : lerp(middle, max, t);
+}
+
+void SetVertices(uint3 id, uint polyCount)
+{
+    if (id.y > sampling.y || id.z > sampling.x || id.x >= id.z * polyCount)
+    {
+        return;
+    }
+    
+    if (id.z < (id.y == 0 || id.y == sampling.y ? 0 : sampling.x))
+    {
+        return;
+    }
+    
+    uint verticesCount = 2 * BaseCount(polyCount) + SideCount(polyCount);
+    uint index = VertexIndex(polyCount, id.x, id.y, id.z);
+    
+    if (index >= verticesCount)
+    {
+        return;
+    }
+    
+    uint polyIndex = id.z == 0 ? 0 : (id.x / id.z);
+    uint nextPolyIndex = (polyIndex + 1) % polyCount;
+    float3 ratio = float3(float(id.x - id.z * polyIndex) / id.z, float(id.y) / sampling.y, float(id.z) / sampling.x);
+    
+    float centerHeight = CenterHeight(polyCount);
+    
+    if (id.z == 0)
+    {
+        float height = ratio.y * centerHeight;
+        vertices[index].position = float3(0.0, height, 0.0);
+    }
+    else
+    {
+        float height = ratio.y * lerp(lerp(polySummits[polyIndex].y, polySummits[nextPolyIndex].y, ratio.x), centerHeight, 1.0 - ratio.z);
+        float3 position = ratio.z * lerp(polySummits[polyIndex], polySummits[nextPolyIndex], ratio.x);
+    
+        vertices[index].position = float3(position.x, height, position.z);
+    }
+}
+
+void SetTriangles (uint3 id, uint polyCount)
+{
+    if (id.z > 0 && (id.y == 0 || id.y == sampling.y))
+    {
+        int nx = (id.x + 1) % (id.z * polyCount);
+
+        int dz = id.z - 1;
+        int pi = id.x / id.z;
+        int npi = (pi + 1) % polyCount;
+        int s = id.x - id.z * pi;
+        int ns = (s + 1) % id.z;
+
+        int r = pi * dz + s;
+        int nr = npi * dz + ns;
+        
+        Triangle triangle1;
+        triangle1.subIndex = 0;
+        triangle1.a = VertexIndex(polyCount, s < dz ? r : nr, 0, dz);
+        triangle1.b = VertexIndex(polyCount, id.x, 0, id.z);
+        triangle1.c = VertexIndex(polyCount, nx, 0, id.z);
+        
+        Triangle triangle2;
+        triangle2.subIndex = 2;
+        triangle2.a = VertexIndex(polyCount, id.x, sampling.y, id.z);
+        triangle2.b = VertexIndex(polyCount, s < dz ? r : nr, sampling.y, dz);
+        triangle2.c = VertexIndex(polyCount, nx, sampling.y, id.z);
+        
+        triangles.Append(triangle1);
+        triangles.Append(triangle2);
+        
+        if (s < dz)
+        {
+            int dns = (s + 1) % dz;
+            int dr = pi * dz + dns;
+            int dnr = npi * dz + dns;
+            
+            Triangle triangle3;
+            triangle3.subIndex = 0;
+            triangle3.a = VertexIndex(polyCount, s + 1 < dz ? dr : dnr, 0, dz);
+            triangle3.b = VertexIndex(polyCount, pi * dz + s, 0, dz);
+            triangle3.c = VertexIndex(polyCount, pi * id.z + ns, 0, id.z);
+            
+            Triangle triangle4;
+            triangle4.subIndex = 2;
+            triangle4.a = VertexIndex(polyCount, pi * dz + s, sampling.y, dz);
+            triangle4.b = VertexIndex(polyCount, s + 1 < dz ? dr : dnr, sampling.y, dz);
+            triangle4.c = VertexIndex(polyCount, pi * id.z + ns, sampling.y, id.z);
+            
+            triangles.Append(triangle3);
+            triangles.Append(triangle4);
+        }
+    }
+    
+    if (id.z == sampling.x && (id.y != 0 && id.y != sampling.y))
+    {
+        int dy = id.y - 1;
+        int nx = (id.x + 1) % (sampling.x * polyCount);
+        
+        Triangle triangle5;
+        triangle5.subIndex = 1;
+        triangle5.a = VertexIndex(polyCount, id.x, dy, sampling.x);
+        triangle5.b = VertexIndex(polyCount, id.x, id.y, sampling.x);
+        triangle5.c = VertexIndex(polyCount, nx, id.y, sampling.x);
+        
+        Triangle triangle6;
+        triangle6.subIndex = 1;
+        triangle6.a = VertexIndex(polyCount, id.x, dy, sampling.x);
+        triangle6.b = VertexIndex(polyCount, nx, id.y, sampling.x);
+        triangle6.c = VertexIndex(polyCount, nx, dy, sampling.x);
+        
+        triangles.Append(triangle5);
+        triangles.Append(triangle6);
+    }
+}
+
+[numthreads(8, 4, 2)]
+void BuildPrismMesh (uint3 id : SV_DispatchThreadID)
+{
+    uint polyCount;
+    uint sizeStruct;
+    polySummits.GetDimensions(polyCount, sizeStruct);
+    
+    SetVertices(id, polyCount);
+    SetTriangles(id, polyCount);
+}
